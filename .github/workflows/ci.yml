@@ -26,7 +26,7 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/orbit-cloud
           path: orbit-cloud
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
