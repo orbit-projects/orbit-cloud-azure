@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -23,6 +24,7 @@ from typing import Any, Protocol, cast
 
 from azure.core.credentials_async import AsyncTokenCredential
 from azure.core.exceptions import HttpResponseError, ServiceRequestError, ServiceResponseError
+from azure.core.pipeline.policies import AsyncRetryPolicy
 from azure.identity.aio import DefaultAzureCredential
 from azure.mgmt.resourcegraph.aio import ResourceGraphClient
 from azure.mgmt.resourcegraph.models import QueryRequest, QueryRequestOptions
@@ -49,8 +51,28 @@ CredentialFactory = Callable[[], AsyncTokenCredential]
 ClientFactory = Callable[[AsyncTokenCredential, AzureCloudInventoryConfig], _AzureGraphClient]
 
 
+class _JitteredAsyncRetryPolicy(AsyncRetryPolicy[Any, Any]):
+    """Azure retry policy with bounded full jitter between transient attempts."""
+
+    def get_backoff_time(self, settings: dict[str, Any]) -> float:
+        """Return a random delay from zero to the capped exponential interval."""
+        consecutive_errors = len(settings["history"])
+        if consecutive_errors <= 0:
+            return 0.0
+        interval = min(
+            settings["max_backoff"],
+            settings["backoff"] * (2 ** (consecutive_errors - 1)),
+        )
+        return random.uniform(0.0, interval)
+
+
 class AzureCloudInventory:
-    """List resources from one Azure subscription using Azure Resource Graph."""
+    """List resources from one Azure subscription using a fixed Resource Graph projection.
+
+    The client and credential are created lazily, shared across bounded requests, and owned by
+    this provider until ``aclose()``. Queries project only resource ID, name, type, and location;
+    arbitrary KQL and resource mutations are not supported.
+    """
 
     def __init__(
         self,
@@ -64,12 +86,15 @@ class AzureCloudInventory:
         self._client_factory = client_factory or _default_client_factory
         self._credential: AsyncTokenCredential | None = None
         self._client: _AzureGraphClient | None = None
+        self._client_closed = False
+        self._credential_closed = False
         self._client_lock = asyncio.Lock()
         self._condition = asyncio.Condition()
         self._semaphore = asyncio.Semaphore(self.config.max_concurrency)
         self._active = 0
         self._closing = False
         self._closed = False
+        self._close_failed = False
 
     async def _get_client(self) -> _AzureGraphClient:
         async with self._client_lock:
@@ -78,7 +103,13 @@ class AzureCloudInventory:
                 try:
                     client = self._client_factory(credential, self.config)
                 except BaseException:
-                    await credential.close()
+                    try:
+                        await credential.close()
+                    except BaseException:
+                        # Retain ownership so aclose() can retry the failed cleanup. Block new
+                        # requests until shutdown has either completed or surfaced the failure.
+                        self._credential = credential
+                        self._close_failed = True
                     raise
                 self._credential = credential
                 self._client = client
@@ -87,7 +118,7 @@ class AzureCloudInventory:
     @asynccontextmanager
     async def _use_client(self) -> AsyncIterator[_AzureGraphClient]:
         async with self._condition:
-            if self._closing or self._closed:
+            if self._closing or self._closed or self._close_failed:
                 raise CloudOperationError("closed", "Azure inventory provider is closed.")
             self._active += 1
         try:
@@ -186,9 +217,10 @@ class AzureCloudInventory:
                 self._condition.notify_all()
                 raise
         close_failed = False
-        if self._client is not None:
+        if self._client is not None and not self._client_closed:
             try:
                 await self._client.close()
+                self._client_closed = True
             except asyncio.CancelledError:
                 async with self._condition:
                     self._closing = False
@@ -196,9 +228,10 @@ class AzureCloudInventory:
                 raise
             except Exception:
                 close_failed = True
-        if self._credential is not None:
+        if self._credential is not None and not self._credential_closed:
             try:
                 await self._credential.close()
+                self._credential_closed = True
             except asyncio.CancelledError:
                 async with self._condition:
                     self._closing = False
@@ -207,7 +240,8 @@ class AzureCloudInventory:
             except Exception:
                 close_failed = True
         async with self._condition:
-            self._closed = True
+            self._closed = not close_failed
+            self._close_failed = close_failed
             self._closing = False
             self._condition.notify_all()
         if close_failed:
@@ -225,8 +259,18 @@ def _default_client_factory(
             credential,
             connection_timeout=config.connect_timeout_seconds,
             read_timeout=config.request_timeout_seconds,
-            retry_total=3,
+            retry_policy=_build_retry_policy(config),
         ),
+    )
+
+
+def _build_retry_policy(config: AzureCloudInventoryConfig) -> _JitteredAsyncRetryPolicy:
+    """Create the bounded, jittered retry policy used by Azure Resource Graph calls."""
+    return _JitteredAsyncRetryPolicy(
+        retry_total=config.retry_total,
+        retry_backoff_factor=config.retry_initial_backoff_seconds,
+        retry_backoff_max=config.retry_max_backoff_seconds,
+        retry_mode="exponential",
     )
 
 

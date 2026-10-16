@@ -4,7 +4,7 @@ Lists Azure resources from one subscription using asynchronous Azure Resource Gr
 
 This is the `Azure Resource Graph `resources` query API` adapter for the provider-neutral [`orbit-cloud`](https://github.com/orbit-projects/orbit-cloud) capability. It performs **read-only inventory**. It never provisions, modifies, or deletes cloud resources.
 
-**Status:** pre-alpha. Contract tests use fake SDK clients and need no cloud credentials. No hosted CI, live-provider, production, support, or release-readiness claim is implied.
+**Status:** unpublished v0.1.0-alpha review candidate. Contract tests use fake SDK clients and need no cloud credentials. No hosted CI, live-provider, production, support, or release-readiness claim is implied.
 
 ## Install
 
@@ -22,11 +22,11 @@ provider = AzureCloudInventory()
 try:
     page = await provider.list_resources(
         CloudInventoryQuery(
-        scope="12345678-1234-5678-1234-567812345678",
-        resource_types=("Microsoft.Compute/virtualMachines",),
-        locations=("eastus",),
-        page_size=100,
-    )
+            scope="12345678-1234-5678-1234-567812345678",
+            resource_types=("Microsoft.Compute/virtualMachines",),
+            locations=("eastus",),
+            page_size=100,
+        )
     )
     for resource in page.resources:
         print(resource.resource_type, resource.resource_id)
